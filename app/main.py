@@ -1,5 +1,7 @@
+import logging
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -10,6 +12,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -17,11 +20,15 @@ from PySide6.QtWidgets import (
 )
 
 from . import ai, crawler, screenshot, writer
+from .logger import setup_logging
+
+log = logging.getLogger("main")
 
 
 class RecognizeWorker(QThread):
     done = Signal(dict)
     error = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, url):
         super().__init__()
@@ -29,11 +36,20 @@ class RecognizeWorker(QThread):
 
     def run(self):
         try:
+            self.progress.emit(5, "抓取頁面內容…")
             content = crawler.fetch_and_clean(self.url)
-            path_tags = ai.ask_path_and_tags(content)
-            summary = ai.ask_summary(content)
+
+            self.progress.emit(35, "AI 生成路徑與標籤（並行）…")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_tags = pool.submit(ai.ask_path_and_tags, content)
+                f_summary = pool.submit(ai.ask_summary, content)
+                path_tags = f_tags.result()
+                summary = f_summary.result()
+
+            self.progress.emit(100, "識別完成")
             self.done.emit({"content": content, "path_tags": path_tags, "summary": summary})
         except Exception as e:
+            log.exception("識別失敗")
             self.error.emit(str(e))
 
 
@@ -63,6 +79,11 @@ class Window(QMainWindow):
         self.accept_btn = QPushButton("接受並保存")
         self.accept_btn.clicked.connect(self.on_accept)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+
         self.status_label = QLabel("就緒")
 
         top = QHBoxLayout()
@@ -83,6 +104,7 @@ class Window(QMainWindow):
         layout.addWidget(self.tags_edit)
         layout.addLayout(fb)
         layout.addWidget(self.accept_btn)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
 
         container = QWidget()
@@ -97,18 +119,33 @@ class Window(QMainWindow):
         if not url:
             QMessageBox.warning(self, "提示", "請先貼上 URL")
             return
-        self.status_label.setText("抓取與總結中…")
+        self._start_progress("抓取與總結中…")
         self.recognize_btn.setEnabled(False)
         self.worker = RecognizeWorker(url)
+        self.worker.progress.connect(self.on_progress)
         self.worker.done.connect(self.on_recognize_done)
         self.worker.error.connect(self.on_error)
         self.worker.start()
+
+    def _start_progress(self, text):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(text)
+
+    def _end_progress(self):
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setValue(0)
+
+    def on_progress(self, value, text):
+        self.progress_bar.setValue(value)
+        self.status_label.setText(text)
 
     def on_recognize_done(self, result):
         self.content = result["content"]
         self.summary_edit.setPlainText(result["summary"])
         self._apply_path_tags(result["path_tags"])
         self.recognize_btn.setEnabled(True)
+        self._end_progress()
         self.status_label.setText("識別完成，可修改或接受")
 
     def _apply_path_tags(self, text):
@@ -127,7 +164,7 @@ class Window(QMainWindow):
         feedback = self.feedback_input.text().strip()
         if not feedback or not self.content:
             return
-        self.status_label.setText("AI 修改中…")
+        self._start_progress("AI 修改中…")
         self.feedback_btn.setEnabled(False)
         self.fb_worker = FeedbackWorker(self.content, feedback)
         self.fb_worker.done.connect(self.on_feedback_done)
@@ -138,6 +175,7 @@ class Window(QMainWindow):
         self.summary_edit.setPlainText(summary)
         self.feedback_btn.setEnabled(True)
         self.feedback_input.clear()
+        self._end_progress()
         self.status_label.setText("已按意見修改總結")
 
     def on_accept(self):
@@ -151,20 +189,24 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "提示", "總結、路徑、標籤不可為空")
             return
         self.status_label.setText("截圖與保存中…")
+        self._start_progress("截圖與保存中…")
         self.save_worker = SaveWorker(
             self.url_input.text().strip(), summary, tags, path
         )
+        self.save_worker.progress.connect(self.on_progress)
         self.save_worker.done.connect(self.on_save_done)
         self.save_worker.error.connect(self.on_error)
         self.save_worker.start()
 
     def on_save_done(self, msg):
+        self._end_progress()
         self.status_label.setText(msg)
         QMessageBox.information(self, "完成", msg)
 
     def on_error(self, err):
         self.recognize_btn.setEnabled(True)
         self.feedback_btn.setEnabled(True)
+        self._end_progress()
         self.status_label.setText(f"錯誤：{err}")
         QMessageBox.critical(self, "錯誤", err)
 
@@ -188,6 +230,7 @@ class FeedbackWorker(QThread):
 class SaveWorker(QThread):
     done = Signal(str)
     error = Signal(str)
+    progress = Signal(int, str)
 
     def __init__(self, url, summary, tags, path):
         super().__init__()
@@ -200,17 +243,29 @@ class SaveWorker(QThread):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 img = Path(tmp) / "shot.jpg"
+                self.progress.emit(10, "截圖中…")
                 screenshot.screenshot(self.url, img)
+                self.progress.emit(60, "寫入 md 文件…")
                 writer.save(self.url, self.summary, self.tags, self.path, img)
+            self.progress.emit(80, "git commit…")
             if writer.commit(f"收藏：{self.path.split('/')[-1]}"):
+                self.progress.emit(90, "git push…")
                 writer.push()
+            self.progress.emit(100, "完成")
             self.done.emit("已保存並提交")
         except Exception as e:
+            log.exception("保存失敗")
             self.error.emit(str(e))
 
 
 def main():
+    setup_logging()
+    log.info("PickLink 啟動")
     app = QApplication(sys.argv)
     win = Window()
     win.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

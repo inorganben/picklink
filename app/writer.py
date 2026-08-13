@@ -1,8 +1,11 @@
+import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger("writer")
 
 
 def build_md(url, summary, tags, path):
@@ -36,15 +39,19 @@ def save(url, summary, tags, path, image_path):
 
     md_path = md_dir / f"{title}.md"
     md_path.write_text(build_md(url, summary, tags, path), encoding="utf-8")
+    log.info("已寫入 %s", md_path)
     return md_path
 
 
 def commit(message):
     repo = config.ROOT
     try:
+        log.info("git add -A")
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        log.info("git commit -m %r", message)
         subprocess.run(["git", "commit", "-m", message], cwd=repo, check=True)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        log.error("git commit 失敗：%s", e)
         return False
     return True
 
@@ -52,7 +59,9 @@ def commit(message):
 def push():
     repo = config.ROOT
     try:
+        log.info("git push")
         subprocess.run(["git", "push"], cwd=repo, check=True)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        log.error("git push 失敗：%s", e)
         return False
     return True
